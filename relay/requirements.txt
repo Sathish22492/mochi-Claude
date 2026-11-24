@@ -1,0 +1,6 @@
+anthropic>=0.40
+websockets>=12
+faster-whisper>=1.0
+numpy
+scipy
+python-dotenv
