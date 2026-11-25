@@ -21,11 +21,12 @@ WebSocketsClient ws;
 Preferences prefs;
 StreamBufferHandle_t playBuf;
 
-enum Face : uint8_t { F_BOOT, F_IDLE, F_LISTEN, F_THINK, F_SPEAK, F_NOLINK, F_SETUP };
-enum Emo : uint8_t { E_NEUTRAL, E_HAPPY, E_SAD, E_SURPRISED, E_SLEEPY, E_LOVE, E_ANGRY };
+enum Face : uint8_t { F_BOOT, F_STANDBY, F_LISTEN, F_THINK, F_SPEAK, F_NOLINK, F_SETUP };
+enum Emo : uint8_t { E_NEUTRAL, E_HAPPY, E_SAD, E_SURPRISED, E_SLEEPY, E_LOVE, E_ANGRY, E_BORED };
 
 volatile Face faceState = F_BOOT;
 volatile Emo emo = E_NEUTRAL;
+volatile bool wifiOk = false;       // false = still joining WiFi, true = WiFi up, waiting for relay
 volatile uint32_t emoClearAt = 0;
 volatile bool speaking = false;     // audio is arriving / playing -> mic is muted
 volatile bool audioEnded = false;   // relay said the last sentence was sent
@@ -38,6 +39,33 @@ volatile int volumePct = DEFAULT_VOLUME;
 
 String cfgSsid, cfgPass, cfgHost;
 uint16_t cfgPort = RELAY_PORT_DEFAULT;
+
+// ------------------------------------------------------------------ status LED
+static void setLed(uint8_t r, uint8_t g, uint8_t b) {
+  if (PIN_LED >= 0) neopixelWrite(PIN_LED, r, g, b);
+}
+
+// Status light: green = listening (your turn), red = thinking/speaking (don't talk),
+// yellow = standby (tap BOOT or say "Hey Mochi"), blue = starting / connecting.
+static void updateLed() {
+  static int lastState = -1;
+  Face f = faceState;
+  int st;
+  if (f == F_BOOT || f == F_SETUP || f == F_NOLINK) st = 0;
+  else if (speaking || f == F_THINK || f == F_SPEAK) st = 1;
+  else if (f == F_LISTEN) st = 2;
+  else st = 3;
+  if (st == lastState) return;
+  lastState = st;
+  switch (st) {
+    case 0: setLed(0, 0, 40); break;
+    case 1: setLed(50, 0, 0); break;
+    case 2: setLed(0, 40, 0); break;
+    default: setLed(45, 25, 0); break;
+  }
+}
+
+static float yawnAmt = 0;
 
 // ------------------------------------------------------------------ face drawing
 static void drawHeart(int cx, int cy, int s) {
@@ -55,6 +83,15 @@ static void drawEye(int cx, int cy, int w, int h, Emo e, bool left, bool blink) 
     return;
   }
   if (e == E_LOVE) { drawHeart(cx, cy, 9); return; }
+  if (e == E_BORED) {  // heavy lids
+    if (blink) { u8g2.drawRBox(cx - w / 2, cy + 4, w, 4, 2); return; }
+    u8g2.drawRBox(cx - w / 2, cy - h / 2, w, h, 8);
+    u8g2.setDrawColor(0);
+    u8g2.drawBox(cx - w / 2 - 1, cy - h / 2 - 1, w + 2, (h * 11) / 20);
+    u8g2.setDrawColor(1);
+    u8g2.drawHLine(cx - w / 2 - 1, cy - h / 2 + (h * 11) / 20, w + 2);
+    return;
+  }
   if (blink) { u8g2.drawRBox(cx - w / 2, cy - 2, w, 4, 2); return; }
   u8g2.drawRBox(cx - w / 2, cy - h / 2, w, h, 8);
   u8g2.setDrawColor(0);
@@ -78,7 +115,12 @@ static void drawMouth(Face f, Emo e, bool spk) {
     u8g2.drawFilledEllipse(mx, 49, 9, mh);
     return;
   }
-  if (f == F_LISTEN) { u8g2.drawCircle(mx, 50, 3); return; }
+  if (f == F_LISTEN) { u8g2.drawDisc(mx, 41, 10, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT); return; }
+  if (f == F_STANDBY) {  // bored: flat, slightly crooked mouth; occasional yawn
+    if (yawnAmt > 0.05f) u8g2.drawFilledEllipse(mx, 50, 6 + (int)(yawnAmt * 3), 2 + (int)(yawnAmt * 9));
+    else u8g2.drawLine(mx - 8, 51, mx + 8, 49);
+    return;
+  }
   if (f == F_THINK) { u8g2.drawHLine(mx - 6, 50, 12); return; }
   switch (e) {
     case E_HAPPY:     u8g2.drawDisc(mx, 41, 10, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT); break;
@@ -117,15 +159,24 @@ static void drawFace() {
   Emo e = emo;
   if (e != E_NEUTRAL && !spk && emoClearAt && now > emoClearAt) { emo = E_NEUTRAL; e = E_NEUTRAL; }
   if (f == F_NOLINK) e = E_SLEEPY;
+  if (f == F_LISTEN && !spk) e = E_NEUTRAL;   // listening = happy smile
+  if (f == F_STANDBY && !spk) e = E_BORED;    // standby = bored
 
   static uint32_t nextBlink = 0, blinkEnd = 0;
   if (now > nextBlink) { blinkEnd = now + 140; nextBlink = now + random(2200, 5500); }
   bool blink = now < blinkEnd;
 
   int w = 22, h = 28, dx = 0, dy = 0;
-  if (f == F_LISTEN && !spk) { w = 24; h = 32; }
   if (f == F_THINK && !spk) { dx = (int)(sinf(now / 450.0f) * 9.0f); dy = -2; }
   if (e == E_SURPRISED) { w = 26; h = 34; }
+
+  yawnAmt = 0;
+  if (f == F_STANDBY && !spk) {
+    dx = (int)(sinf(now / 1700.0f) * 7.0f);   // slow bored glance left and right
+    dy = 5;
+    uint32_t ph = now % 22000;                 // a yawn every ~22 s
+    if (ph > 19500) { yawnAmt = sinf(((ph - 19500) / 2500.0f) * 3.14159f); blink = true; dx = 0; }
+  }
 
   drawEye(38 + dx, 24 + dy, w, h, e, true, blink);
   drawEye(90 + dx, 24 + dy, w, h, e, false, blink);
@@ -137,7 +188,12 @@ static void drawFace() {
   }
   if (f == F_NOLINK) {
     u8g2.setFont(u8g2_font_5x7_tr);
-    u8g2.drawStr(34, 63, "connecting...");
+    if (!wifiOk) {
+      u8g2.drawStr(30, 63, "joining WiFi...");
+    } else {
+      String line = "relay " + cfgHost + ":" + String(cfgPort);
+      u8g2.drawStr(0, 63, line.c_str());
+    }
   }
   if (e == E_SLEEPY && f != F_NOLINK) {
     u8g2.setFont(u8g2_font_5x7_tr);
@@ -149,6 +205,7 @@ static void drawFace() {
 static void displayTask(void*) {
   for (;;) {
     drawFace();
+    updateLed();
     vTaskDelay(pdMS_TO_TICKS(40));
   }
 }
@@ -271,7 +328,7 @@ static void handleJson(uint8_t* payload, size_t length) {
     if (!strcmp(v, "listening")) faceState = F_LISTEN;
     else if (!strcmp(v, "thinking")) faceState = F_THINK;
     else if (!strcmp(v, "speaking")) faceState = F_SPEAK;
-    else faceState = F_IDLE;
+    else faceState = F_STANDBY;   // "standby" or "idle"
   } else if (!strcmp(t, "emotion")) {
     emo = parseEmo(v);
     emoClearAt = 0;
@@ -289,13 +346,15 @@ static void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
       wsUp = true;
-      faceState = F_IDLE;
+      faceState = F_STANDBY;
+      Serial.println("[ws] connected to relay");
       ws.sendTXT("{\"t\":\"hello\",\"fw\":\"" FW_VERSION "\"}");
       break;
     case WStype_DISCONNECTED:
       wsUp = false;
       faceState = F_NOLINK;
       flushReq = true;
+      Serial.println("[ws] not connected to relay (is relay.py running? right IP? firewall?)");
       break;
     case WStype_TEXT:
       handleJson(payload, length);
@@ -402,12 +461,20 @@ void setup() {
   if (wantSetup || cfgSsid.isEmpty() || cfgHost.isEmpty()) runSetupPortal();
 
   faceState = F_NOLINK;
+  wifiOk = false;
+  Serial.printf("[wifi] joining '%s'\n", cfgSsid.c_str());
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
   t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(200);
-  if (WiFi.status() != WL_CONNECTED) runSetupPortal();  // wrong password etc.
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[wifi] failed, opening setup portal");
+    runSetupPortal();  // wrong password, 5 GHz-only network, etc.
+  }
+  wifiOk = true;
+  Serial.printf("[wifi] connected, device IP %s, relay %s:%u\n",
+                WiFi.localIP().toString().c_str(), cfgHost.c_str(), cfgPort);
 
   playBuf = xStreamBufferCreate(PLAY_BUFFER_BYTES, 1);
   initMic();
