@@ -1,5 +1,5 @@
 #pragma once
-#define FW_VERSION "0.1.0"
+#define FW_VERSION "0.3.0"
 
 // ---- OLED (SSD1306 128x64, I2C): from your wiring diagram ----
 #define PIN_OLED_SDA 41
@@ -20,7 +20,7 @@
 #define PIN_SPK_DOUT 7
 #define PIN_SPK_EN   -1    // set to a GPIO number if the amp has an enable pin
 
-#define PIN_LED      48    // onboard RGB LED (WS2812); -1 disables
+#define PIN_LED      48    // onboard RGB LED (WS2812) as on the stock build; -1 disables
 #define PIN_BUTTON   0     // BOOT button: tap = push-to-talk / interrupt
 
 #define SAMPLE_RATE          16000

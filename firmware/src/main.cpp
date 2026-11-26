@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
 #include "config.h"
+#include "scenes.h"
 
 // ------------------------------------------------------------------ globals
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
@@ -22,10 +23,15 @@ Preferences prefs;
 StreamBufferHandle_t playBuf;
 
 enum Face : uint8_t { F_BOOT, F_STANDBY, F_LISTEN, F_THINK, F_SPEAK, F_NOLINK, F_SETUP };
-enum Emo : uint8_t { E_NEUTRAL, E_HAPPY, E_SAD, E_SURPRISED, E_SLEEPY, E_LOVE, E_ANGRY, E_BORED };
+enum Emo : uint8_t { E_NEUTRAL, E_HAPPY, E_SAD, E_SURPRISED, E_SLEEPY, E_LOVE, E_ANGRY, E_BORED, E_CRY, E_LAUGH, E_WINK };
 
 volatile Face faceState = F_BOOT;
 volatile Emo emo = E_NEUTRAL;
+// pictures and clock shown instead of the face for a few seconds
+volatile int sceneId = -1;
+volatile uint32_t sceneUntil = 0;
+volatile uint32_t clockUntil = 0;
+char clockH[4] = "", clockM[4] = "", clockAp[4] = "";
 volatile bool wifiOk = false;       // false = still joining WiFi, true = WiFi up, waiting for relay
 volatile uint32_t emoClearAt = 0;
 volatile bool speaking = false;     // audio is arriving / playing -> mic is muted
@@ -75,7 +81,14 @@ static void drawHeart(int cx, int cy, int s) {
 }
 
 static void drawEye(int cx, int cy, int w, int h, Emo e, bool left, bool blink) {
-  if (e == E_HAPPY) {  // ^ ^
+  if (e == E_WINK && !left) {  // right eye closed: happy arc
+    for (int d = 0; d < 3; d++) {
+      u8g2.drawLine(cx - 12, cy + 4 + d, cx, cy - 6 + d);
+      u8g2.drawLine(cx, cy - 6 + d, cx + 12, cy + 4 + d);
+    }
+    return;
+  }
+  if (e == E_HAPPY || e == E_LAUGH) {  // ^ ^
     for (int d = 0; d < 3; d++) {
       u8g2.drawLine(cx - 12, cy + 6 + d, cx, cy - 6 + d);
       u8g2.drawLine(cx, cy - 6 + d, cx + 12, cy + 6 + d);
@@ -97,7 +110,7 @@ static void drawEye(int cx, int cy, int w, int h, Emo e, bool left, bool blink) 
   u8g2.setDrawColor(0);
   if (e == E_SLEEPY) {
     u8g2.drawBox(cx - w / 2 - 1, cy - h / 2 - 1, w + 2, h / 2 + 1);
-  } else if (e == E_SAD || e == E_ANGRY) {
+  } else if (e == E_SAD || e == E_ANGRY || e == E_CRY) {
     // sad: outer top corners droop; angry: inner top corners drop
     bool cutRight = (e == E_ANGRY) ? left : !left;
     int x0 = cutRight ? cx + w / 2 + 1 : cx - w / 2 - 1;
@@ -106,6 +119,15 @@ static void drawEye(int cx, int cy, int w, int h, Emo e, bool left, bool blink) 
     u8g2.drawTriangle(x0, y0, x1, y0, x0, y0 + 13);
   }
   u8g2.setDrawColor(1);
+  if (e == E_CRY) {  // tears streaming down
+    uint32_t t = millis() / 22;
+    for (int k = 0; k < 2; k++) {
+      int ty = cy + h / 2 - 3 + (int)((t + k * 13) % 26);
+      int tx = cx + (left ? -4 : 4);
+      u8g2.drawDisc(tx, ty, 2);
+      u8g2.drawVLine(tx, ty - 5, 3);
+    }
+  }
 }
 
 static void drawMouth(Face f, Emo e, bool spk) {
@@ -115,7 +137,7 @@ static void drawMouth(Face f, Emo e, bool spk) {
     u8g2.drawFilledEllipse(mx, 49, 9, mh);
     return;
   }
-  if (f == F_LISTEN) { u8g2.drawDisc(mx, 41, 10, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT); return; }
+  if (f == F_LISTEN && e == E_NEUTRAL) { u8g2.drawDisc(mx, 41, 10, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT); return; }
   if (f == F_STANDBY) {  // bored: flat, slightly crooked mouth; occasional yawn
     if (yawnAmt > 0.05f) u8g2.drawFilledEllipse(mx, 50, 6 + (int)(yawnAmt * 3), 2 + (int)(yawnAmt * 9));
     else u8g2.drawLine(mx - 8, 51, mx + 8, 49);
@@ -128,8 +150,28 @@ static void drawMouth(Face f, Emo e, bool spk) {
     case E_SURPRISED: u8g2.drawCircle(mx, 50, 5); break;
     case E_SLEEPY:    u8g2.drawHLine(mx - 5, 50, 10); break;
     case E_ANGRY:     u8g2.drawHLine(mx - 8, 50, 16); break;
+    case E_CRY: {
+      int wob = (int)(fabsf(sinf(millis() / 110.0f)) * 3.0f);
+      u8g2.drawFilledEllipse(mx, 53, 8, 3 + wob);
+      break;
+    }
+    case E_LAUGH:     u8g2.drawDisc(mx, 38, 15, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT); break;
     default:          u8g2.drawCircle(mx, 43, 7, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT); break;
   }
+}
+
+static void drawClock() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_logisoso32_tn);
+  int wh = u8g2.getStrWidth(clockH), wm = u8g2.getStrWidth(clockM), colon = 12;
+  int x = (128 - (wh + colon + wm)) / 2;
+  u8g2.drawStr(x, 42, clockH);
+  u8g2.drawDisc(x + wh + colon / 2, 25, 2);
+  u8g2.drawDisc(x + wh + colon / 2, 36, 2);
+  u8g2.drawStr(x + wh + colon, 42, clockM);
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.drawStr(58, 60, clockAp);
+  u8g2.sendBuffer();
 }
 
 static void drawFace() {
@@ -155,11 +197,17 @@ static void drawFace() {
     return;
   }
 
+  if (now < clockUntil) { drawClock(); return; }
+  if (now < sceneUntil && sceneId >= 0 && sceneId < SCENE_COUNT) {
+    u8g2.drawXBM(0, 0, 128, 64, SCENES[sceneId].bits);
+    u8g2.sendBuffer();
+    return;
+  }
+
   bool spk = speaking;
   Emo e = emo;
   if (e != E_NEUTRAL && !spk && emoClearAt && now > emoClearAt) { emo = E_NEUTRAL; e = E_NEUTRAL; }
   if (f == F_NOLINK) e = E_SLEEPY;
-  if (f == F_LISTEN && !spk) e = E_NEUTRAL;   // listening = happy smile
   if (f == F_STANDBY && !spk) e = E_BORED;    // standby = bored
 
   static uint32_t nextBlink = 0, blinkEnd = 0;
@@ -170,6 +218,7 @@ static void drawFace() {
   if (f == F_THINK && !spk) { dx = (int)(sinf(now / 450.0f) * 9.0f); dy = -2; }
   if (e == E_SURPRISED) { w = 26; h = 34; }
 
+  if (e == E_LAUGH) dy += ((now / 80) % 2) ? 1 : -1;   // shaking with laughter
   yawnAmt = 0;
   if (f == F_STANDBY && !spk) {
     dx = (int)(sinf(now / 1700.0f) * 7.0f);   // slow bored glance left and right
@@ -316,6 +365,9 @@ static Emo parseEmo(const char* s) {
   if (!strcmp(s, "sleepy")) return E_SLEEPY;
   if (!strcmp(s, "love")) return E_LOVE;
   if (!strcmp(s, "angry")) return E_ANGRY;
+  if (!strcmp(s, "cry")) return E_CRY;
+  if (!strcmp(s, "laugh")) return E_LAUGH;
+  if (!strcmp(s, "wink")) return E_WINK;
   return E_NEUTRAL;
 }
 
@@ -339,6 +391,21 @@ static void handleJson(uint8_t* payload, size_t length) {
     volumePct = constrain(vol, 0, 100);
   } else if (!strcmp(t, "stop")) {
     flushReq = true;
+  } else if (!strcmp(t, "scene")) {
+    int sec = doc["sec"] | 10;
+    int id = -1;
+    for (int i = 0; i < SCENE_COUNT; i++) if (!strcmp(SCENES[i].name, v)) id = i;
+    sceneId = id;
+    sceneUntil = id >= 0 ? millis() + (uint32_t)sec * 1000UL : 0;
+  } else if (!strcmp(t, "clock")) {
+    int sec = doc["sec"] | 8;
+    const char* hh = doc["h"] | "";
+    const char* mm = doc["m"] | "";
+    const char* ap = doc["ap"] | "";
+    snprintf(clockH, sizeof(clockH), "%s", hh);
+    snprintf(clockM, sizeof(clockM), "%s", mm);
+    snprintf(clockAp, sizeof(clockAp), "%s", ap);
+    clockUntil = millis() + (uint32_t)sec * 1000UL;
   }
 }
 
@@ -432,6 +499,8 @@ static void handleButton() {
     uint32_t d = millis() - pressT;
     if (d > 30 && d < 1500) {
       flushReq = true;  // interrupt any speech
+      sceneUntil = 0;   // dismiss picture / clock
+      clockUntil = 0;
       if (wsUp) ws.sendTXT("{\"t\":\"ptt\"}");
     }
   }
@@ -490,6 +559,7 @@ void setup() {
 void loop() {
   static int32_t raw[FRAME_SAMPLES];
   static int16_t pcm[FRAME_SAMPLES];
+  static int32_t xPrev = 0, yPrev = 0;   // DC blocker state (removes the mic's constant offset)
 
   ws.loop();
   handleButton();
@@ -497,12 +567,16 @@ void loop() {
   size_t got = 0;
   i2s_read(I2S_NUM_0, raw, sizeof(raw), &got, pdMS_TO_TICKS(100));
   size_t n = got / 4;
-  if (n == 0 || !wsUp || speaking || millis() < micResumeAt) return;
+  if (n == 0) return;
   for (size_t i = 0; i < n; i++) {
-    int32_t s = raw[i] >> MIC_SHIFT;
-    if (s > 32767) s = 32767;
-    if (s < -32768) s = -32768;
-    pcm[i] = (int16_t)s;
+    int32_t x = raw[i] >> MIC_SHIFT;
+    int32_t y = x - xPrev + yPrev - (yPrev >> 6);
+    xPrev = x;
+    yPrev = y;
+    if (y > 32767) y = 32767;
+    if (y < -32768) y = -32768;
+    pcm[i] = (int16_t)y;
   }
+  if (!wsUp || speaking || millis() < micResumeAt) return;
   ws.sendBIN((uint8_t*)pcm, n * 2);
 }
