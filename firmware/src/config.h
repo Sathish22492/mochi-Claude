@@ -1,5 +1,5 @@
 #pragma once
-#define FW_VERSION "0.3.0"
+#define FW_VERSION "0.4.0"
 
 // ---- OLED (SSD1306 128x64, I2C): from your wiring diagram ----
 #define PIN_OLED_SDA 41

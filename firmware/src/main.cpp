@@ -32,6 +32,13 @@ volatile int sceneId = -1;
 volatile uint32_t sceneUntil = 0;
 volatile uint32_t clockUntil = 0;
 char clockH[4] = "", clockM[4] = "", clockAp[4] = "";
+// big text (maths answers) and scrolling subtitles
+char bigText[48] = "";
+volatile uint32_t bigUntil = 0;
+static char subBuf[600];
+volatile int subLen = 0;
+volatile float subX = 128;
+volatile float subSpeed = 60;
 volatile bool wifiOk = false;       // false = still joining WiFi, true = WiFi up, waiting for relay
 volatile uint32_t emoClearAt = 0;
 volatile bool speaking = false;     // audio is arriving / playing -> mic is muted
@@ -122,7 +129,7 @@ static void drawEye(int cx, int cy, int w, int h, Emo e, bool left, bool blink) 
   if (e == E_CRY) {  // tears streaming down
     uint32_t t = millis() / 22;
     for (int k = 0; k < 2; k++) {
-      int ty = cy + h / 2 - 3 + (int)((t + k * 13) % 26);
+      int ty = cy + h / 2 - 3 + (int)((t + k * 8) % 17);
       int tx = cx + (left ? -4 : 4);
       u8g2.drawDisc(tx, ty, 2);
       u8g2.drawVLine(tx, ty - 5, 3);
@@ -133,8 +140,8 @@ static void drawEye(int cx, int cy, int w, int h, Emo e, bool left, bool blink) 
 static void drawMouth(Face f, Emo e, bool spk) {
   const int mx = 64;
   if (spk) {
-    int mh = 2 + (int)(mouthLevel * 14.0f);
-    u8g2.drawFilledEllipse(mx, 49, 9, mh);
+    int mh = 2 + (int)(mouthLevel * 7.0f);
+    u8g2.drawFilledEllipse(mx, 47, 9, mh);
     return;
   }
   if (f == F_LISTEN && e == E_NEUTRAL) { u8g2.drawDisc(mx, 41, 10, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT); return; }
@@ -152,12 +159,66 @@ static void drawMouth(Face f, Emo e, bool spk) {
     case E_ANGRY:     u8g2.drawHLine(mx - 8, 50, 16); break;
     case E_CRY: {
       int wob = (int)(fabsf(sinf(millis() / 110.0f)) * 3.0f);
-      u8g2.drawFilledEllipse(mx, 53, 8, 3 + wob);
+      u8g2.drawFilledEllipse(mx, 50, 8, 2 + wob);
       break;
     }
     case E_LAUGH:     u8g2.drawDisc(mx, 38, 15, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT); break;
     default:          u8g2.drawCircle(mx, 43, 7, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT); break;
   }
+}
+
+static void drawBigText() {
+  u8g2.clearBuffer();
+  static const uint8_t* fonts[] = {u8g2_font_logisoso28_tr, u8g2_font_logisoso24_tr, u8g2_font_logisoso20_tr,
+                                   u8g2_font_logisoso16_tr, u8g2_font_helvB12_tr};
+  static const int heights[] = {28, 24, 20, 16, 12};
+  for (int i = 0; i < 5; i++) {
+    u8g2.setFont(fonts[i]);
+    int w = u8g2.getStrWidth(bigText);
+    if (w <= 126) {
+      int x = (128 - w) / 2;
+      u8g2.drawStr(x < 0 ? 0 : x, 32 + heights[i] / 2, bigText);
+      u8g2.sendBuffer();
+      return;
+    }
+  }
+  // too long for one line: split at '=' and use two lines
+  char left[48], right[48];
+  const char* eq = strchr(bigText, '=');
+  int cut = eq ? (int)(eq - bigText) : (int)strlen(bigText) / 2;
+  snprintf(left, sizeof(left), "%.*s", cut, bigText);
+  snprintf(right, sizeof(right), "%s", bigText + cut);
+  u8g2.setFont(u8g2_font_helvB12_tr);
+  int wl = u8g2.getStrWidth(left), wr = u8g2.getStrWidth(right);
+  u8g2.drawStr(wl > 126 ? 0 : (128 - wl) / 2, 26, left);
+  u8g2.drawStr(wr > 126 ? 0 : (128 - wr) / 2, 52, right);
+  u8g2.sendBuffer();
+}
+
+// Scrolling subtitle along the bottom 8 pixel rows (5x7 font is fixed width: 5 px per character)
+static void drawSubtitle(uint32_t now) {
+  static uint32_t last = 0;
+  static char local[600];
+  float dt = last ? (now - last) / 1000.0f : 0.0f;
+  last = now;
+  if (dt > 0.2f) dt = 0.2f;
+  int len = subLen;
+  if (len <= 0 || len > 595) return;
+  memcpy(local, subBuf, len);
+  local[len] = 0;
+  float x = subX - subSpeed * dt;
+  subX = x;
+  if (x + 5.0f * len < 0) { subLen = 0; return; }   // fully scrolled out
+  int skip = 0;
+  if (x < 0) skip = (int)ceilf(-x / 5.0f);          // u8g2 cannot draw at negative x: skip whole characters
+  if (skip >= len) { subLen = 0; return; }
+  int px = (int)(x + skip * 5.0f);
+  if (px < 0) px = 0;
+  u8g2.setDrawColor(0);
+  u8g2.drawBox(0, 56, 128, 8);
+  u8g2.setDrawColor(1);
+  u8g2.setFont(u8g2_font_5x7_tr);
+  u8g2.drawStr(px, 63, local + skip);
 }
 
 static void drawClock() {
@@ -198,6 +259,7 @@ static void drawFace() {
   }
 
   if (now < clockUntil) { drawClock(); return; }
+  if (now < bigUntil) { drawBigText(); return; }
   if (now < sceneUntil && sceneId >= 0 && sceneId < SCENE_COUNT) {
     u8g2.drawXBM(0, 0, 128, 64, SCENES[sceneId].bits);
     u8g2.sendBuffer();
@@ -248,6 +310,7 @@ static void drawFace() {
     u8g2.setFont(u8g2_font_5x7_tr);
     u8g2.drawStr(108, 10, "z");
   }
+  drawSubtitle(now);
   u8g2.sendBuffer();
 }
 
@@ -391,12 +454,35 @@ static void handleJson(uint8_t* payload, size_t length) {
     volumePct = constrain(vol, 0, 100);
   } else if (!strcmp(t, "stop")) {
     flushReq = true;
+    subLen = 0;
   } else if (!strcmp(t, "scene")) {
     int sec = doc["sec"] | 10;
     int id = -1;
     for (int i = 0; i < SCENE_COUNT; i++) if (!strcmp(SCENES[i].name, v)) id = i;
     sceneId = id;
     sceneUntil = id >= 0 ? millis() + (uint32_t)sec * 1000UL : 0;
+  } else if (!strcmp(t, "text")) {
+    int sec = doc["sec"] | 10;
+    char tmp[48];
+    int n = 0;
+    for (const char* p = v; *p && n < 46; p++) if (*p >= 32 && *p < 127) tmp[n++] = *p;
+    tmp[n] = 0;
+    memcpy(bigText, tmp, n + 1);
+    bigUntil = millis() + (uint32_t)sec * 1000UL;
+  } else if (!strcmp(t, "sub")) {
+    if (v[0] == 0) {
+      subLen = 0;
+    } else {
+      float cps = doc["cps"] | 13.0f;
+      int len = subLen;
+      if (len <= 0) { len = 0; subX = 128; }
+      else if (len + 3 + 120 < (int)sizeof(subBuf) - 5) { memcpy(subBuf + len, "   ", 3); len += 3; }
+      else { len = 0; subX = 128; }
+      for (const char* p = v; *p && len < (int)sizeof(subBuf) - 5; p++) if (*p >= 32 && *p < 127) subBuf[len++] = *p;
+      subBuf[len] = 0;
+      subSpeed = constrain(cps * 5.0f, 30.0f, 100.0f);
+      subLen = len;
+    }
   } else if (!strcmp(t, "clock")) {
     int sec = doc["sec"] | 8;
     const char* hh = doc["h"] | "";
@@ -499,8 +585,10 @@ static void handleButton() {
     uint32_t d = millis() - pressT;
     if (d > 30 && d < 1500) {
       flushReq = true;  // interrupt any speech
-      sceneUntil = 0;   // dismiss picture / clock
+      sceneUntil = 0;   // dismiss picture / clock / answer
       clockUntil = 0;
+      bigUntil = 0;
+      subLen = 0;
       if (wsUp) ws.sendTXT("{\"t\":\"ptt\"}");
     }
   }
