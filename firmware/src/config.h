@@ -1,5 +1,6 @@
 #pragma once
-#define FW_VERSION "0.4.0"
+#define FW_VERSION "0.5.0"
+#define DEVICE_NAME "Mimi"   // shown on the boot screen and used for the setup WiFi name ("<name>-Setup"); keep it short
 
 // ---- OLED (SSD1306 128x64, I2C): from your wiring diagram ----
 #define PIN_OLED_SDA 41

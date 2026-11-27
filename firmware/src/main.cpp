@@ -244,14 +244,15 @@ static void drawFace() {
     u8g2.setFont(u8g2_font_6x10_tr);
     u8g2.drawStr(0, 10, "WiFi setup mode");
     u8g2.drawStr(0, 26, "1. Join WiFi:");
-    u8g2.drawStr(0, 38, "   Mochi-Setup");
+    u8g2.drawStr(0, 38, "   " DEVICE_NAME "-Setup");
     u8g2.drawStr(0, 54, "2. Open 192.168.4.1");
     u8g2.sendBuffer();
     return;
   }
   if (f == F_BOOT) {
     u8g2.setFont(u8g2_font_helvB14_tr);
-    u8g2.drawStr(34, 30, "Mochi");
+    int nw = u8g2.getStrWidth(DEVICE_NAME);
+    u8g2.drawStr(nw >= 128 ? 0 : (128 - nw) / 2, 30, DEVICE_NAME);
     u8g2.setFont(u8g2_font_5x7_tr);
     u8g2.drawStr(8, 52, "BOOT btn = WiFi setup");
     u8g2.sendBuffer();
@@ -539,12 +540,12 @@ static void loadConfig() {
   faceState = F_SETUP;
   WiFi.disconnect(true);
   WiFi.mode(WIFI_AP);
-  WiFi.softAP("Mochi-Setup");
+  WiFi.softAP(DEVICE_NAME "-Setup");
   static WebServer server(80);
   server.on("/", HTTP_GET, []() {
     String h = F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
                  "<body style='font-family:sans-serif;max-width:420px;margin:2em auto;padding:0 1em'>"
-                 "<h2>Mochi setup</h2><form method=post action=/save>"
+                 "<h2>" DEVICE_NAME " setup</h2><form method=post action=/save>"
                  "WiFi name<br><input name=ssid style='width:100%;padding:8px' value='");
     h += cfgSsid;
     h += F("'><br><br>WiFi password<br><input name=pass type=password style='width:100%;padding:8px'>"
